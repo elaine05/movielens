@@ -1,0 +1,701 @@
+---
+title: "Analysis"
+author: "Serafina"
+date: "4/22/2019"
+output: pdf_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+
+```
+
+## Problem
+Given a movie rating historical data, Our task is to create a recommendation system using predictive approach which aims to predict the rating value for a user-movie combination. We'll study and analyzed using Regression and Matrix Factorization with Stochastic Gradient Boosting (SGD).
+
+RMSE will be used for the evaluation of the model on validation dataset (10% of the historical dataset). The rating column will used to evaluate the prediction result from the model.
+
+
+## Exploratory Analysis
+
+Load libraries and the edx dataset
+```{r} 
+library(tidyverse)
+library(data.table)
+library(Matrix.utils)
+library(DT)
+library(lubridate)
+
+library(irlba)
+library(recommenderlab)
+library(recosystem)
+#library(h2o)
+library(caret)
+library(kableExtra)
+
+library(wordcloud) 
+library(RColorBrewer) 
+library(ggthemes) 
+
+load("~/harvard.RData")
+```
+
+Originally, The dataset consist of 7 features for a total of ```r dim(edx)[1]``` observations, where each row represents a rating per user per movie. There some issues such as, most of the movies have their debut year added to their names - we want to extract this into separate columns. Also, Genres columns contains multiple categories per row - we want to have them separated into one category per row. We're using below piece of code to solve above issues.
+
+```{r} 
+edx <- sample_n(edx, 4000055)
+glimpse(edx)
+```
+Due to my limited memory, I will take sample from the edx dataset, i.e.  ```r dim(edx)[1]```. Then the validation set will about 10% from these new dataset.
+
+# Data Cleaning
+```{r} 
+edx <- edx %>%
+  # generic function to turn (no genres listed) to NA
+  mutate(genres = if_else(genres == "(no genres listed)", `is.na<-`(genres), genres))
+glimpse(edx)
+```
+
+```{r} 
+#check if some movies don't have debut year  
+edx %>%  filter(is.na(title) | is.na(year))
+```
+All the movies listed have their debut year. It's great.
+
+
+#Data Exploratory
+
+## How was the trend of growth of movies?
+
+```{r} 
+edx %>%
+  na.omit() %>% # omit missing values
+  select(movieId, year) %>% # select columns we need 
+  group_by(year) %>% # group by year
+  summarise(numb = n())  %>% # number of produced movies per year
+  arrange(desc(year)) %>%
+  complete(year = full_seq(year, 1), fill = list(numb = 0)) %>% # in case there are issue where there were no movies produced in the early years. 
+  ggplot(aes(x = year, y = numb)) + #plot
+  geom_line(color="red")+theme_economist_white() +
+  ggtitle("The growth rate of Movies")
+```
+There's an exponential growth of the movie business and a sudden drop in 2000. The latter is caused by the fact that the data is collected until October 2000 so we don't have the full data on this year.Growing popularity of the Internet must have had a positive impact on the demand for movies. That is certainly something worthy of further analysis.
+
+## Which Genres get the most Rating?
+Let's see which genres is the most popular based on their rating frequency
+
+```{r} 
+library(DT)
+gen <- edx %>% separate_rows(genres, sep = "\\|") %>%
+  group_by(genres) %>%
+  summarize(freq = n()) %>%
+  arrange(desc(freq))
+
+head(gen)
+
+```
+It's not surprise there, the majority of people love drama 
+
+```{r }
+library(wordcloud2)
+layout(matrix(c(1,2), nrow =2) , heights = c(1,4))
+par(mar=rep(0,4))
+plot.new()
+text(x=0.5,y=0.5, "Popular Genres based on number of ratings")
+print(wordcloud2(data = gen))
+```
+
+
+```{r}
+tmp <- edx %>%
+  na.omit() %>% # omit missing values
+  select(movieId, year, genres) %>% # select columns we are interested in
+  separate_rows(genres, sep = "\\|") %>% # separate genres into rows
+  mutate(genres = as.factor(genres)) %>% # turn genres in factors
+  group_by(year, genres) %>% # group data by year and genre
+  summarise(freq = n()) %>% # count
+  complete(year = full_seq(year, 1), genres, fill = list(number = 0))  # add missing years/genres 
+tmp <- tmp %>% na.omit() %>% filter(genres %in% c("Drama", "Action", "Comedy", "Thriller", "Adventure")) %>%
+  ggplot(aes(x = year, y = freq)) +
+    geom_line(aes(color=genres))+scale_fill_brewer(palette = "Paired")+theme_economist_white()
+print(tmp)
+```
+
+There are multiple things to observe:
+1. There is rapid growth of Drama movies after 1990, this is modernism area where Hollywood emerged. Child-oriented drama also become more popular in Disney movies.
+
+2. There is a rise of popularity of Action movies, the most probable reason might be the growth of development in computer technology advancement which made the production much easier. 
+
+3. Although the Adventure movie has reached its peak at the same time as other genres, it seems people tend to like other genres more.
+
+4. Although thriller genres reached its peak in 1995, it still has the lowest peak among the other genres.  
+
+5. As we notice Comedy and Drama movies almost have the same rise and peak, it probably an afteraffect of by the end of the 1970s, Comedy clubs were beginning to spring up everywhere.The comics that had gotten famous in the '70s were now the veterans as a flood of new faces came onto the scene. 
+
+## What were the best movies of every decade (based on users's ratings)?
+First, we need to find what is the highest rated movies in every decade by calculating the average score for each movie
+
+```{r}
+#free memory
+rm(tmp)
+rm(validation, na_df, t)
+```
+
+```{r} 
+avRating <- edx %>% 
+  na.omit() %>%
+  select(title, rating, year) %>%
+  group_by(title, year) %>%
+  summarise(count = n(), mean = mean(rating), min = min(rating), max = max(rating)) %>%
+  ungroup() %>%
+  arrange(desc(mean))
+print(head(avRating))
+```
+
+We have a problem here, if we sort by average score our ranking will be polluted by movies with low count of rating. To address this problem we'll use weighted average IMDB website for their Top 250 ranking[https://districtdatalabs.silvrback.com/computing-a-bayesian-estimate-of-star-rating-means]
+
+```{r} 
+# A = average for the movie (mean) = (Rating)
+# V = number of votes for the movie = (votes)
+# v = minimum votes required to be listed in the Top 250
+# m = the mean vote across the whole report
+weighted<- function(A, V, v, m) {
+  return (V/(V+v))*A + (v/(V+v))*m
+}
+
+avRating<- avRating %>%
+  mutate(w = weighted(mean, count, 500, mean(mean))) %>%
+  arrange(desc(w)) %>%
+  select(title, year, count, mean, w)
+
+print(head(avRating))
+```
+It's seem better than before. Movies with more good reviews got higher score.  
+
+```{r} 
+# find best movie of a decade based on score
+# heavily dependent on the number of reviews
+movDecade <- avRating %>%
+  mutate(decade = year  %/% 10 * 10) %>%
+  arrange(year, desc(w)) %>%
+  group_by(decade) %>%
+  summarise(title = first(title), w = first(w), mean = first(mean), count = first(count))
+head(movDecade)
+
+```
+
+We notice the disadvantage of weighted ratings - low score for old movies. That's not necessarily caused by movies quality, rather small number of viewers.
+
+
+## What were the best years for a genre (based on users's ratings)?
+
+```{r} 
+genresRate <- edx %>%
+  na.omit() %>%
+  select(everything(), -c(timestamp,userId)) %>%
+  mutate(decade = year  %/% 10 * 10) %>%
+  separate_rows(genres, sep = "\\|") %>%
+  group_by(year, genres) %>%
+  summarise(count = n(), avg_rating = mean(rating)) %>%
+  ungroup() %>%
+  mutate(wr = weighted(mean, count, 5000, mean(mean))) %>%
+  arrange(year)
+
+genresRate %>%
+  filter(genres %in% c("Action", "Comedy", "Drama", "Thriller")) %>%
+  ggplot(aes(x = year, y = wr)) +
+    geom_line(aes(group=genres, color=genres)) +
+    geom_smooth(aes(group=genres, color=genres)) +
+    facet_wrap(~genres)
+```
+
+Notice the fact that the rating of the movies across these genres is increasing from year to year.
+
+
+## Does the user has rating consistency when they rate movie? Is there any observeable pattern?
+
+Here we take the top 20 most active user and analyze the trend of their rating
+
+```{r} 
+#Find the top N most active user
+top <- edx %>% select(userId, rating) %>% group_by(userId) %>% summarize(numofrate = n()) %>% arrange(desc(numofrate)) %>% top_n(200)
+print(head(top))
+```
+
+```{r} 
+edx %>%
+  filter(userId %in% top$userId) %>%
+  mutate(date = round_date(as_datetime(timestamp), unit = "week")) %>%
+  group_by(date) %>%
+  summarize(rating = mean(rating)) %>%
+  ggplot(aes(date, rating)) +
+  geom_point() +
+  geom_smooth() +
+  ggtitle("Timestamp, time unit : month")+
+  labs(subtitle = "median ratings",
+       caption = "source data : edx set")
+```
+
+As we see from above figure, clearly there's a consistency on rating.It doesn't show a strong effect of time. Notice here instead using the mean we're using the median to calculate the rating consistency.
+
+
+##
+```{r} 
+library(stringi)
+#Extract and add the premier date to the df
+edx1 <- edx %>% mutate(premier_date = as.numeric(stri_extract(edx$title, regex = "(\\d{4})", comments = TRUE )))
+```
+
+```{r echo=FALSE}
+edx1[edx1$movieId == "27266", "premier_date"] <- 2004
+edx1[edx1$movieId == "671", "premier_date"] <- 1996
+edx1[edx1$movieId == "2308", "premier_date"] <- 1973
+edx1[edx1$movieId == "4159", "premier_date"] <- 2001
+edx1[edx1$movieId == "5310", "premier_date"] <- 1985
+edx1[edx1$movieId == "8864", "premier_date"] <- 2004
+edx1[edx1$movieId == "1422", "premier_date"] <- 1997
+edx1[edx1$movieId == "4311", "premier_date"] <- 1998
+edx1[edx1$movieId == "5472", "premier_date"] <- 1972
+edx1[edx1$movieId == "6290", "premier_date"] <- 2003
+edx1[edx1$movieId == "6645", "premier_date"] <- 1971
+edx1[edx1$movieId == "8198", "premier_date"] <- 1960
+edx1[edx1$movieId == "8905", "premier_date"] <- 1992
+edx1[edx1$movieId == "53953", "premier_date"] <- 2007
+```
+
+## Does the age of the movie affect the given rating?
+
+```{r} 
+#calculate the age of the movie using this year as pivot as well as the rating date using premier date as the pivot
+edx1 <- edx %>% mutate(yearRated = year(as_datetime(timestamp)))
+edx1<- edx1 %>% mutate(age_of_movie = 2019 - year, 
+ratingRangeofDate = year - yearRated)
+head(edx1)
+```
+
+```{r}
+# group by the age of movie, and calculate its distribution and plot
+edx1 %>% select(movieId, age_of_movie, rating) %>% group_by(age_of_movie) %>% summarize(rate = n()) %>% arrange(desc(rate)) %>% ggplot(aes(x = age_of_movie,y = rate, fill = factor(age_of_movie)), show.legend=FALSE)+geom_col(show.legend = FALSE)
+```
+
+The majority of rating data lies on 25th quartile. It's imply that people tend to rate a movie which has been premiere for less and equal to 25 years, old age movie is left behind. There's an effect caused by the age of movie.
+
+## There is some debate about is "Are The Old Movies Better Than The New Ones ?". 
+
+We will doing some analysis to answer this questions using question such as does old movies get better ratings than new movies?
+```{r}
+movAvg <- edx1 %>% group_by(movieId) %>% summarize(avgMovRate = mean(rating))
+
+userAvg <- edx1 %>% group_by(userId) %>% summarize(avgUserRate = mean(rating))
+
+# when is the movie being rated?
+yearAvg <- edx1%>% mutate(yearRated = year(as_datetime(timestamp)) ) %>% group_by(yearRated) %>% summarize(avgRatebyYear = mean(rating)) 
+#age of movie
+ageAvgs <- edx1 %>% group_by(age_of_movie) %>% summarize(avgbyAge = mean(rating)) 
+```
+
+```{r} 
+print(head(ageAvgs))
+
+print(head(userAvg))
+```
+
+```{r} 
+library(ggthemes)
+ageAvgs %>%
+  ggplot(aes(age_of_movie, avgbyAge)) +
+  geom_point(colour="red") +
+  theme_excel()+
+  ggtitle("Age of a Movie vs Average Movie Rating")
+```
+
+Notice from above, old movies have a higher rating than the new movies, maybe user who doing the rating thinks old movies are more creative than new movies.
+
+
+# Data Processing
+
+## Is there any observeable linear pattern from the ratings dataset?
+```{r }
+p <- edx1 %>%
+  mutate(date = round_date(as_datetime(timestamp), unit = "week")) %>%
+  group_by(date) %>%
+  summarize(rating = mean(rating)) %>%
+  ggplot(aes(date, rating)) +
+  geom_point(show.legend = FALSE) +
+  geom_smooth(show.legend = FALSE) +
+  theme_excel_new()+
+  ggtitle("Timestamp, time unit : week")+
+  ggtitle("average ratings")
+
+print(p)
+```
+
+```{r} 
+#free memory
+rm(edx1)
+rm(na_df,t, validation)
+```
+
+## Is the data sparse? 
+```{r} 
+
+#Calculate how many unique user and movie
+edx %>% summarize(n_users = n_distinct(userId),
+            n_movies = n_distinct(movieId))
+
+```
+
+It show that there are less movies provided for ratings than users that rated them. From matrix perspective where each row and column represent user and movie respectively, this surely will affect the sparsity of the data since many cells will end up being empty.Somehow, we need to address the fact that not every user has rated every movie which will affect the sparsity of the data. 
+
+```{r}
+set.seed(12453)
+id <- createDataPartition(edx$rating, p = 0.9, list=FALSE)
+train <- edx[id,]
+validation <- edx[-id,]
+
+```
+
+```{r} 
+library(dplyr)
+edxcopy <- train %>% select(userId, movieId,rating)
+#treat movieID and userID as factor  then convert the variables into numeric since sparseMatrix only work with numeric vectors
+edxcopy$movieId <- as.factor(edxcopy$movieId)
+edxcopy$userId <- as.factor(edxcopy$userId)
+edxcopy$movieId <- as.numeric(edxcopy$movieId)
+edxcopy$userId <- as.numeric(edxcopy$userId)
+
+# convert to uxm matrix where each row represent user, each column represent movie
+sparseRate<- sparseMatrix(i = edxcopy$userId,
+                         j = edxcopy$movieId ,
+                         x = edxcopy$rating, 
+                         dims = c(length(unique(edxcopy$userId)),
+                                  length(unique(edxcopy$movieId))),  
+                         dimnames = list(paste("u", 1:length(unique(edxcopy$userId)), sep = ""), 
+                                        paste("m", 1:length(unique(edxcopy$movieId)), sep = "")))
+
+#free some memory
+rm(edxcopy)
+
+sparseRate[1:10,1:10]
+
+```
+It's necessary to check the distributions of the number of reviews given by each user.The density is plotted along the y-axis instead of the raw counts, to give an idea of the the proportional frequency of each unit of each discrete bin in relation to the whole data set. The overall left-skewed distribution is indicative that most reviewers give very few overall reviews. 
+
+```{r} 
+#convert to matrix for easier calculation
+matxrat <- new("realRatingMatrix", data = sparseRate)
+rpp <- rowCounts(matxrat) %>%
+  data.frame(reviewsPerPerson = .)
+p1 <- rpp %>%
+  ggplot(aes(x = reviewsPerPerson, fill='#FFA07A')) + 
+    geom_histogram(aes(y = ..density..), binwidth = 20, show.legend = FALSE) +
+    scale_y_continuous(limits = c(0,.0125), 
+                       breaks = seq(0, .0125, by = 0.0025),
+                       labels = seq(0, .0125, by = 0.0025)) +
+  theme_economist_white()+
+    ggtitle('Number of Ratings Per Movies Reviewer')
+print(summary(rowCounts(matxrat)))
+
+print(p1)
+
+```
+
+Take a look from above, at the average number of ratings given per each of the movie. The left skew distribution shown above indicate that there are a handful of movies with very high reviews, probably reflecting those films in the dataset with mass commercial appeal and the majority of films in the dataset are scarcely reviewed.
+
+
+With a median number of reviews of `r median(colCounts(matxrat))` per user and `r ncol(matxrat)` different movies available to rate, we know that the data is sparse caused by not every user watch every movie.
+
+```{r} 
+mrf <- colCounts(matxrat) %>%
+  data.frame(movieReviewFreq = .) %>%
+  ggplot(aes(x = movieReviewFreq)) + 
+    geom_histogram(aes(y = ..density.., fill = 'blue'),show.legend = FALSE, binwidth = 20) +theme_classic()
+    ggtitle('Number of Reviews Per MovieLense listed Movie')
+    
+print(summary(colCounts(matxrat)))
+
+print(mrf)
+```
+
+# Data Transformation
+Now, let's transform our data into a rating matrix which we will used as an input in recommender labs package
+```{r} 
+#Convert rating matrix into a recommenderlab sparse matrix
+matxrat <- new("realRatingMatrix", data = sparseRate)
+matxrat
+```
+Notice that now we had a pretty huge matrix due to how big our dataset is. This will lead to a memory issues. By reducing the dimensionality using Matrix package the data processing will reduce the cost of time and deal more efficiently with the memory problem.
+
+Dimensionality reduction could be done by observing is there any similar user or movies that have the same rating characteristics towards each other. Let's see the similarity for each user and movies, for readibilily we would only take and calculate the similarity of the first 25 users and movies.
+
+```{r} 
+#using cosine to calculate user-user similarity 
+simuser <- similarity(matxrat[1:25,], 
+                               method = "cosine", 
+                               which = "users")
+
+image(as.matrix(simuser), main = "User similarity")
+
+
+
+#using cosine to calculate movies-movies similarity 
+
+simmov <- similarity(matxrat[,1:25], 
+                               method = "cosine", 
+                               which = "items")
+
+image(as.matrix(simmov), main = "Movies similarity")
+```
+
+Notice two things:
+1. Each rows and columns represent user-user as well for the movies.
+2. The red diagonal indicate the similarity between the user and itself, it's comparing to him/herself.
+
+There are evidences the existence of a group of user and movies.Since there are more similar ratings between certain users than others, and more similar ratings between certain movies than others.
+
+
+
+Addresssing the RAM memory problem, the Irlba package is used, which it is a fast and memory-efficient way to compute a partial SVD. The augmented implicitly restarted Lanczos bidiagonalization algorithm (IRLBA) finds a few approximate largest (or, optionally, smallest) singular values and corresponding singular vectors of a sparse or dense matrix using a method of Baglama and Reichel. We're going to use Matrix factorization[https://rafalab.github.io/dsbook/matrix-factorization.html] which decompose the I x J matrix M with J < I as follow: 
+                      
+                                M = UVD^T
+
+into three matrices, 
+
+U : orthogonal matrix of dimensions N x m 
+D : diagonal matrix containing the singular values of the original matrix, m x m 
+V : orthogonal matrix of dimensions m x P
+
+```{r} 
+set.seed(1)
+X <- irlba(sparseRate,tol=1e-4,verbose=TRUE,nv = 100, maxit = 1000)
+
+# plot singular values
+
+plot(X$d, pch=20, col = "darkred", cex = 1.5, xlab='Singular Value', ylab='Magnitude', 
+     main = "Singular Values for User-Movie Matrix")
+
+
+
+```
+
+We try to find the optimal range of k suing trial and error method. We want the a k value which will represent 90-95% of population of our ratings set.
+```{r} 
+set.seed(2)
+# calculate sum of squares of all singular values
+singularSQ <- sum(X$d^2)
+v <- NULL
+for (i in 1:length(X$d)) {
+  v[i] <- sum(X$d[1:i]^2) / singularSQ
+}
+
+plot(v, pch=20, col = "yellow", cex = 1.5, xlab='Singular Value', ylab='% of Sum of Squares of Singular Values', main = "K value represent 95% pop")
+lines(x = c(0,100), y = c(.95, .95))
+
+plot(v, pch=20, col = "yellow", cex = 1.5, xlab='Singular Value', ylab='% of Sum of Squares of Singular Values', main = "K value represent 90% pop")
+lines(x = c(0,100), y = c(.90, .90))
+
+```
+The goal is to identify the optimal value of K which represent our rating matrix in other words whose squares sum to who lies between 90%-95% of the total of the sums of the squares of all of the singular values. From above plot we can see k ranging from 76-79 for 90% and 80-89 for 95%. To get the exact value of k for each of them we done the following
+
+```{r} 
+#calculate  the length of the vector that remains from our sum of squares, including any items within that vector that lies below 90%
+k90 = length(v[v<= 0.90])
+k95 = length(v[v<= 0.95])
+print(k90)
+print(k95)
+
+```
+
+```{r} 
+library(diagonals)
+u90 <- dim(X$u[, 1:k90])
+d90 <- dim(Diagonal(x = X$d[1:k90]))
+v90 <- dim(t(X$v)[1:k90, ])
+
+print(dim(X$u[, 1:k90]))
+print(dim(Diagonal(x = X$d[1:k90])))
+print(dim(t(X$v)[1:k90, ]))
+
+u95 <- dim(X$u[, 1:k95])
+d95 <- dim(Diagonal(x = X$d[1:k95]))
+v95 <- dim(t(X$v)[1:k95, ])
+
+print(dim(X$u[, 1:k95]))
+print(dim(Diagonal(x = X$d[1:k95])))
+print(dim(t(X$v)[1:k95, ]))
+
+ttl90 <- u90[1]*u90[2]+d90[1]*d90[2]+v90[1]*v90[2]
+ttl95 <- u95[1]*u95[2]+d95[1]*d95[2]+v95[1]*v95[2]
+
+print(ttl90)
+
+print(ttl95)
+
+```
+We notice that k=`r ttl90` will retain 90% of variability which has total required size of matrix `r print(ttl90)`. While for k=`r ttl95` for 95% variability, end up with size of matrix equal to `r print(ttl95)`. The size of the matrix originally is  `r(69878*10516)` For k=`r k90`, we decrease into `r ttl90/(69878*10516) * 100`, and `r ttl95/(69878*10516) * 100` for k=`r k95`. 
+
+The difference between size is `r ((ttl95/(69878*10516) * 100) - (ttl90/(69878*10516) * 100)) * 100`, while the difference for k value is `r k95-k90`. It means the difference between k-value, i.e. `r k95-k90` is equal to the addition of 1 Million rows. The cost is high, hence we select k equal to k=`r ttl90`.
+
+Intuitively we know some users have been more ACTIVE than others also some movies that has been rated by many users. We'll use this to filter our user-movies ratings matrix.
+
+```{r }
+#minimum num of movie per user
+movperuser <- quantile(rowCounts(matxrat), 0.9)
+#minimum num of user per movie
+userpermov <- quantile(colCounts(matxrat), 0.9)
+#filter using above condition
+matxrat <- matxrat[rowCounts(matxrat) > movperuser,colCounts(matxrat) > userpermov]
+
+print(' minimum number of movies per user')
+print(movperuser)
+print('minimum number of users per movie')
+print(userpermov)
+print('matrix contains users and movies matching these criteria')
+print(matxrat)
+```
+Now, we ended up with a rating matrix of `r dim(matxrat)[1]` distinct users (rows) x `r dim(matxrat)[2]` distinct movies(columns) , with `r dim(matxrat)[1]*dim(matxrat)[2]` ratings.
+
+
+# Training, Testing Method and Analysis
+We use the following approach to build our model, we know that:
+1. Some of the movies had a higher rating compare to the others.
+2. Some users are more active than others at rating movies. 
+3. From earlier, there are some rating fluctuations caused by time effect.
+
+## Regression Models
+```{r} 
+#calculate mean of the rating dataset
+mu <- mean(train$rating)
+movieav <- train %>% 
+  group_by(movieId) %>% 
+  summarize(b_i = mean(rating - mu))
+
+userav <- train %>%  
+  left_join(movieav, by='movieId') %>%
+  group_by(userId) %>%
+  summarize(b_u = mean(rating - mu - b_i))
+
+
+# calculate time affect from the training set
+tmp <- train %>%
+  left_join(movieav, by='movieId') %>%
+  left_join(userav, by='userId') %>%
+  mutate(date = round_date(as_datetime(timestamp), unit = "week")) %>%
+  group_by(date) %>%
+  summarize(b_t = mean(rating - mu - b_i - b_u))
+
+
+#tmp for date feature creation from timestamp at validation dataset
+valid <- validation
+valid <- valid %>%
+  mutate(date = round_date(as_datetime(timestamp), unit = "week")) 
+
+#use model from training and applying to validation set
+pred <- valid %>% 
+  left_join(movieav, by='movieId') %>%
+  left_join(userav, by='userId') %>%
+  left_join(tmp, by='date') %>%
+  mutate(pred = mu + b_i + b_u + b_t) %>%
+  .$pred
+
+#calculate the rmse of validation after applying the model from train set
+#note that I using sampling at the begining, therefore there must be some rows which doesn't exist in training set but exist in validation set, which resulting an NA, we'll drop the NA
+df <- cbind(pred, validation$rating) %>% as_tibble() %>% drop_na()
+colnames(df) <- c('pred', 'act')
+rmseLin <- RMSE(df$pred,df$act)  
+print(rmseLin)
+```
+Even though we use the combination of movie, user, and time effects, we still end up with a rmse about `r rmseLin `. 
+
+Now we've stored the rmse, let's take a look for the first 40 prediction.
+
+```{r} 
+df %>% head(40)
+```
+
+## Matrix Factorization with SGD
+
+The purpose of SGD is to get the right gradient on average for much less computation, by using only uses only a single example (a batch size of 1) per iteration. Given enough iterations, SGD works but is very noisy. The term "stochastic" indicates that the one example comprising each batch is chosen at random [https://developers.google.com/machine-learning/crash-course/reducing-loss/stochastic-gradient-descent]
+
+While the use of matrix factorization work as follow: Matrix P represents latent factors of users. So, each k-elements column of matrix P represents each user. Each k-elements column of matrix Q represents each item . So, to find rating for item i by user u we simply need to compute two vectors: P[,u] x Q[,i].[http://www.csie.ntu.edu.tw/~cjlin/papers/libmf/libmf_journal.pdf.] 
+
+```{r} 
+#clear unused memory
+invisible(gc())
+
+edxcopy <-  train %>%
+            select(-c("genres","title","timestamp")) 
+names(edxcopy) <- c("user", "item", "rating")
+edxcopy <- as.matrix(edxcopy)
+
+validcopy <-  validation %>%
+  select(-c("genres","title","timestamp"))
+names(validcopy) <- c("user", "item", "rating")
+validcopy <- as.matrix(validcopy)
+
+#backup the copy and write it on the disk
+write.table(edxcopy , file = "edxset.txt" , sep = " " , row.names = FALSE, col.names = FALSE)
+write.table(validcopy, file = "validset.txt" , sep = " " , row.names = FALSE, col.names = FALSE)
+
+```
+
+```{r} 
+edx_set <- data_file(file.path("edxset.txt"))
+valid_set <- data_file(file.path("validset.txt"))
+
+r <-  Reco()
+
+```
+
+```{r} 
+set.seed(564627) # for reproducible
+# costp_l1 Tuning parameter, the L1 regularization cost for user factors. Can be specified as a numeric vector, with default value c(0, 0.1).
+#costq_l1 Tuning parameter, the L1 regularization cost for item factors. Can be specified as a numeric vector, with default value c(0, 0.1).
+opt <- r$tune(edx_set, opts = list(dim = c(10, 20, 30), lrate = c(0.1, 0.2),
+                                     costp_l1 = 0, costq_l1 = 0,
+                                     nthread = 1, niter = 10))
+
+```
+
+```{r}
+r$train(edx_set, opts = c(opt$min, nthread = 1, niter = 80))
+```
+
+# apply the model to the validation set to make prediction
+```{r} 
+#pred_file = tempfile()
+pred_file <- 'C:/Users/LB3/Documents/sgPred'
+r$predict(valid_set, out_file(pred_file)) 
+```
+
+How about it's RMSE?
+
+```{r} 
+scores_real <- read.table("validset.txt", header = FALSE, sep = " ")$V3
+scores_pred <- scan(pred_file)
+
+#free some memory 
+rm(edxcopy, validcopy)
+
+rmseVal <- RMSE(scores_real,scores_pred)
+rmseVal 
+
+```
+Performing the Matrix factorization with SGD recommender method, we achieved a RMSE `r print(rmseVal)`. 
+
+Now we've stored the rmse, let's take a look for the first 40 prediction.
+
+```{r} 
+dfpred <- cbind(scores_pred, scores_real)
+colnames(dfpred) <- c('pred', 'actual')
+dfpred %>% head(40)
+```
+
+# Conclusion
+The objectives of the project is to predict movie ratings for the 10M version of the Movielens data. The training set is provided (90% from edx dataset) while the validation set is taken about 10% from edx dataset, we had try using different models, such as regression and Matrix factorization with SGD. 
+
+The model evaluation performance through the RMSE ( root mean squared error) showed that the between Linear regression model with effects on users and movies and time, and the Matrix Factorization with Stochastic gradient descent (SGD), the SGD is perform bettter than the regression models, i.e. `r rmseVal` < `r rmseLin`.
+
+
+
+
